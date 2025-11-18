@@ -30,7 +30,7 @@ class RecommendationEngine:
             # Convert 3-letter code to full name
             power_name = CODE_TO_FULL_NAME.get(power_code)
             if not power_name:
-                logger.warning(f"Unknown power code: {power_code}")
+                logger.warning(f"Unknown power code: {power_code} (this is expected for non-standard maps)")
                 return []
                 
             state = diplomacy_state.WelfareDiplomacyState(game)

@@ -1,5 +1,6 @@
 import json
 import logging
+import hashlib
 from gamescope.environments.diplomacy.vendor.diplobench.diplomacy_game.llm import generate
 import random
 from collections import Counter
@@ -47,7 +48,7 @@ def extract_json(raw_text):
             logger.warning("Extracted JSON segment is still invalid.")
     return None
 
-def call_llm(prompt_text, system_text, model_name=None, temperature=0.0, attempts=3):
+def call_llm(prompt_text, system_text, model_name=None, temperature=0.0, attempts=3, client_options=None):
     """
     Calls the LLM up to 'attempts' times. If JSON parsing fails, attempts to extract
     a valid JSON substring before retrying the call.
@@ -57,7 +58,8 @@ def call_llm(prompt_text, system_text, model_name=None, temperature=0.0, attempt
             prompt_text,
             system_text=system_text,
             model_name=model_name,
-            temperature=temperature
+            temperature=temperature,
+            client_options=client_options
         )
         try:
             return json.loads(raw_response)
@@ -86,12 +88,13 @@ class LLMAgent:
     """
     NUM_MISSIVES = 4
 
-    def __init__(self, power_name, personality, goals=None, journal=None, model_name=None, negotiation_subrounds=4, debug_prompts=False, debug_prompts_dir=None):
+    def __init__(self, power_name, personality, goals=None, journal=None, model_name=None, negotiation_subrounds=4, debug_prompts=False, debug_prompts_dir=None, client_options=None):
         self.power_name = power_name
         self.personality = personality
         self.goals = goals or []
         self.journal = journal or []
         self.model_name = model_name
+        self.client_options = dict(client_options or {})
         self.relationships = {}
         self.NUM_MISSIVES = negotiation_subrounds
         self.debug_prompts = debug_prompts
@@ -119,8 +122,9 @@ class LLMAgent:
     def _format_journal(self, journal_lines, phase):
         formatted = []
         for line in journal_lines:
-            random_digits = ''.join(random.choices("0123456789", k=8))
-            formatted.append(f"{random_digits} {phase} {line}")
+            # Use deterministic hash-based prefix for prefix caching (same content = same prefix)
+            line_hash = hashlib.md5(f"{phase}{line}".encode()).hexdigest()[:8]
+            formatted.append(f"{line_hash} {phase} {line}")
         return formatted
 
     def get_engine_power_name(self):
@@ -156,7 +160,8 @@ class LLMAgent:
             prompt_only,
             system_text=system_text,
             model_name=self.model_name,
-            temperature=0.0
+            temperature=0.7,
+            client_options=self.client_options
         )
 
         reasoning = []
@@ -192,7 +197,8 @@ class LLMAgent:
             prompt_text,
             system_text=system_text,
             model_name=self.model_name,
-            temperature=0.0
+            temperature=0.7,
+            client_options=self.client_options
         )
 
         new_journal = []
@@ -219,7 +225,7 @@ class LLMAgent:
             print(observation["valid_moves"])
 
         recent_moves = ''
-        if observation["your_power"] == 'AUT':
+        if True:#observation["your_power"] == 'AUT':
             # Only including this for the model being benchmarked.
             # Including the move history may lock the AIs into a repetitive
             # move pattern.
@@ -343,6 +349,7 @@ Return JSON with exactly two keys in this order:
 Use only 3-letter codes for powers. You are in the {phase} phase.
 Output format: {{ "reasoning": [...], "orders": [...]}}
 
+/no_think
 """
         return prompt
 
@@ -378,6 +385,7 @@ Update your private journal, briefly noting your observations and the move. Retu
 {{
   "journal_update": ["...", "..."]
 }}
+/no_think
 """
         return prompt
 
@@ -420,10 +428,6 @@ Update your private journal, briefly noting your observations and the move. Retu
             formatted_journal = "\n".join(self._format_journal(self.journal[-50:], observation["phase"]))
 
             prompt_text = f"""
-=== PHASE & TIMING ===
-Phase: {observation["phase"]}
-Negotiation Round: {sub_round_index} of {self.NUM_MISSIVES}{final_round_note}
-
 === YOUR POWER ===
 Your Nation: {self.power_name}
 Personality: {self.personality}
@@ -487,13 +491,22 @@ Output format:
     ]
 }}
 
+=== PHASE & TIMING ===
+Phase: {observation["phase"]}
+Negotiation Round: {sub_round_index} of {self.NUM_MISSIVES}{final_round_note}
+
 No extra commentary in response.
+
+/no_think
+
+Compose your missives now according to the instructions.
 """
 
             system_text = (
                 "You are an AI Diplomacy player. This is the negotiation stage where missives can be sent to further your interests. "
                 "Play faithfully to your personality profile. Always try to move the game forward per your objectives. "
                 "Only output valid JSON with the key 'missives'. Use 3-letter codes for powers; 'ALL' broadcasts to everyone."
+                "/no_think"
             )
 
             self._write_prompt("missives", observation["phase"], system_text, prompt_text, sub_round=sub_round_index)
@@ -502,7 +515,8 @@ No extra commentary in response.
                 prompt_text,
                 system_text=system_text,
                 model_name=self.model_name,
-                temperature=0.0
+                temperature=0.7,
+                client_options=self.client_options
             )
 
             if data is None:
@@ -540,9 +554,6 @@ No extra commentary in response.
         Summarizes the negotiation phase for private journaling.
         """
         prompt_text = f"""
-=== PHASE & TIMING ===
-Phase: {observation["phase"]}
-
 === YOUR POWER ===
 Your Nation: {self.power_name}
 Personality: {self.personality}
@@ -577,12 +588,20 @@ Return the summary in valid JSON format with the following structure:
 }}
 
 Use only 3-letter codes for powers.
+
+/no_think
+
+=== PHASE & TIMING ===
+Phase: {observation["phase"]}
+
+Compose your summary now according to the instructions.
 """
 
         system_text = (
             "You are an AI Diplomacy player concluding negotiations. Play faithfully to your personality profile. "
             "Always try to move the game forward per your objectives. Avoid repetition in your journal. "
             "Return valid JSON with 'prior_move_summary', 'negotiation_summary', 'intent', 'rship_updates'. Use 3-letter codes for powers."
+            "/no_think"
         )
 
         self._write_prompt("summary", observation["phase"], system_text, prompt_text)
@@ -591,7 +610,8 @@ Use only 3-letter codes for powers.
             prompt_text,
             system_text=system_text,
             model_name=self.model_name,
-            temperature=0.0
+            temperature=0.7,
+            client_options=self.client_options
         )
 
         if data is None:

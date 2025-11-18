@@ -20,10 +20,6 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers import AutoModel, AutoTokenizer
 
 
-MODEL_NAME = "XXXYYXXZZ/DipLLM"
-TOKENIZER_NAME = "meta-llama/Meta-Llama-3-8B"
-
-
 DATA_BASE_URL = "https://raw.githubusercontent.com/DenisPeskoff/2020_acl_diplomacy/master/data"
 DATA_FILES = {
     "train": "train.jsonl",
