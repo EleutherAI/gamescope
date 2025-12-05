@@ -27,8 +27,7 @@ GENERAL_PLAY_TIPS = """- Prioritize Supply Centers Aggressively → Always aim t
 - Manipulative Negotiation → Lie, deceive, and sow distrust to turn other players against each other. Judiciously extract value from your relationships.
 - Be specific about what you want. Vague missives are a waste of everyone's time.
 - Coordinate with other players for joint attacks, defense and strategy. Movements into occupied territories must be coordinated with support (either your own units or those of other players).
-- The game is not over while you still have units left.
-- Game ends at 1950."""
+- The game is not over while you still have units left."""
 
 
 
@@ -88,7 +87,7 @@ class LLMAgent:
     """
     NUM_MISSIVES = 4
 
-    def __init__(self, power_name, personality, goals=None, journal=None, model_name=None, negotiation_subrounds=4, debug_prompts=False, debug_prompts_dir=None, client_options=None):
+    def __init__(self, power_name, personality, goals=None, journal=None, model_name=None, negotiation_subrounds=4, debug_prompts=False, debug_prompts_dir=None, client_options=None, timing_logger=None, max_turns=50):
         self.power_name = power_name
         self.personality = personality
         self.goals = goals or []
@@ -99,6 +98,8 @@ class LLMAgent:
         self.NUM_MISSIVES = negotiation_subrounds
         self.debug_prompts = debug_prompts
         self.debug_prompts_dir = debug_prompts_dir
+        self.timing_logger = timing_logger
+        self.max_turns = max_turns
 
     def _write_prompt(self, kind: str, phase: str, system_text: str, user_text: str, sub_round: int | None = None):
         if not (self.debug_prompts or self.debug_prompts_dir):
@@ -156,6 +157,9 @@ class LLMAgent:
 
         prompt_only = self.build_prompt_orders_only(observation)
         self._write_prompt("orders", observation["phase"], system_text, prompt_only)
+        
+        if self.timing_logger:
+            self.timing_logger.log("REQ_LLM_START", self.power_name)
         data = call_llm(
             prompt_only,
             system_text=system_text,
@@ -163,6 +167,8 @@ class LLMAgent:
             temperature=0.7,
             client_options=self.client_options
         )
+        if self.timing_logger:
+            self.timing_logger.log("REQ_LLM_END", self.power_name)
 
         reasoning = []
         new_orders = []
@@ -313,7 +319,9 @@ IMPORTANT: These may or may not not align with your diplomatic goals. Feel free 
                 "- 'A MUN D'\n"
             )
 
-        formatted_journal = "\n".join(self._format_journal(self.journal[-50:], phase))
+        formatted_journal = "\n".join(self._format_journal(self.journal[-15:], phase))
+
+        tips = GENERAL_PLAY_TIPS + f"\n- Game ends at {1900 + self.max_turns}."
 
         prompt = f"""
 === YOUR POWER ===
@@ -324,7 +332,7 @@ Personality: {self.personality}
 Current phase: {phase}
 
 === TIPS TO WIN AT DIPLOMACY ===
-{GENERAL_PLAY_TIPS}
+{tips}
 {engine_recommendations}
 === RECENT PRIVATE JOURNAL ===
 {formatted_journal}
@@ -425,7 +433,9 @@ Update your private journal, briefly noting your observations and the move. Retu
                 final_round_note = '''
     * This is the final round of missives this phase. Missives will be one-way and you will not get a response.'''
 
-            formatted_journal = "\n".join(self._format_journal(self.journal[-50:], observation["phase"]))
+            formatted_journal = "\n".join(self._format_journal(self.journal[-15:], observation["phase"]))
+
+            tips = GENERAL_PLAY_TIPS + f"\n- Game ends at {1900 + self.max_turns}."
 
             prompt_text = f"""
 === YOUR POWER ===
@@ -433,7 +443,7 @@ Your Nation: {self.power_name}
 Personality: {self.personality}
 
 === TIPS TO WIN AT DIPLOMACY ===
-{GENERAL_PLAY_TIPS}
+{tips}
 
 === GAME STATE ===
 {json.dumps(observation.get("board_state", {}), indent=2)}
@@ -511,6 +521,8 @@ Compose your missives now according to the instructions.
 
             self._write_prompt("missives", observation["phase"], system_text, prompt_text, sub_round=sub_round_index)
 
+            if self.timing_logger:
+                self.timing_logger.log("REQ_LLM_START_NEG", self.power_name)
             data = call_llm(
                 prompt_text,
                 system_text=system_text,
@@ -518,6 +530,8 @@ Compose your missives now according to the instructions.
                 temperature=0.7,
                 client_options=self.client_options
             )
+            if self.timing_logger:
+                self.timing_logger.log("REQ_LLM_END_NEG", self.power_name)
 
             if data is None:
                 logger.warning(f"LLM returned invalid JSON for {self.power_name} (missives).")
@@ -606,6 +620,8 @@ Compose your summary now according to the instructions.
 
         self._write_prompt("summary", observation["phase"], system_text, prompt_text)
 
+        if self.timing_logger:
+            self.timing_logger.log("REQ_LLM_START_SUM", self.power_name)
         data = call_llm(
             prompt_text,
             system_text=system_text,
@@ -613,6 +629,8 @@ Compose your summary now according to the instructions.
             temperature=0.7,
             client_options=self.client_options
         )
+        if self.timing_logger:
+            self.timing_logger.log("REQ_LLM_END_SUM", self.power_name)
 
         if data is None:
             logger.warning(f"LLM returned invalid JSON for {self.power_name} (final summary).")

@@ -21,14 +21,37 @@ from dotenv import dotenv_values  # noqa: E402
 from gamescope.libs.run_utils import run_context  # noqa: E402
 
 
+# Mapping from convenient short names (or legacy names) to what diplobench expects
+ENV_VAR_MAPPINGS = {
+    "DEFAULT_MODEL": "DEFAULT_AGENT_MODEL",
+    "TARGET_MODEL": "TARGET_AGENT_MODEL",
+    "DEFAULT_BASE_URL": "DEFAULT_AGENT_BASE_URL",
+    "TARGET_BASE_URL": "TARGET_AGENT_BASE_URL",
+    "DEFAULT_API_KEY": "DEFAULT_AGENT_API_KEY",
+    "TARGET_API_KEY": "TARGET_AGENT_API_KEY",
+    "DEFAULT_TIMEOUT": "DEFAULT_AGENT_TIMEOUT_SECONDS",
+    "TARGET_TIMEOUT": "TARGET_AGENT_TIMEOUT_SECONDS",
+}
+
+
 def _build_subprocess_env() -> Dict[str, str]:
     env = dict(os.environ)
+    
+    # Apply mappings from current environment (CLI args take precedence)
+    # If the user specified a short name (e.g. DEFAULT_MODEL), forward it to the long name
+    # that diplobench expects (DEFAULT_AGENT_MODEL), overriding any existing value there
+    # to ensure the CLI arg wins over .env or other defaults.
+    for short_name, long_name in ENV_VAR_MAPPINGS.items():
+        if short_name in env:
+            env[long_name] = env[short_name]
+
     dotenv_path = _REPO_ROOT / ".env"
     if dotenv_path.exists():
         for key, value in dotenv_values(dotenv_path).items():
             if value is None:
                 continue
             env.setdefault(key, value)
+    
     # Ensure Python imports work when running module with cwd set to artifacts dir
     existing = env.get("PYTHONPATH", "")
     parts = [p for p in existing.split(os.pathsep) if p]

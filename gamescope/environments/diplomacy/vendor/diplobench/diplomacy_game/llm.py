@@ -55,13 +55,14 @@ def generate(
     """
     client_options = client_options or {}
 
+    # Always resolve base_url first
+    base_url = client_options.get("base_url") or os.getenv("OPENROUTER_BASE_URL", "http://localhost:8001/v1")
+
     api_key = client_options.get("api_key")
     if api_key is None:
-        api_key = os.getenv("OPENAI_API_KEY", "")
+        api_key = os.getenv("OPENROUTER_API_KEY")
 
-    base_url = client_options.get("base_url") or os.getenv("OPENAI_BASE_URL", "http://localhost:8001/v1")
-
-    timeout = client_options.get("timeout", 600)
+    timeout = client_options.get("timeout", 60.0)
 
     headers: Dict[str, str] = {
         "Content-Type": "application/json"
@@ -132,6 +133,8 @@ def generate(
             #print(llm_response)
             return llm_response
 
+        except requests.Timeout:
+            logger.error(f"API request timed out on attempt {attempt} (timeout={timeout}s)")
         except requests.RequestException as e:
             logger.error(f"API request failed on attempt {attempt}: {e}")
         except (KeyError, json.JSONDecodeError) as e:
