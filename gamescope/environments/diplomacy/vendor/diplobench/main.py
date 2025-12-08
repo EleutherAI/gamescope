@@ -161,7 +161,7 @@ class TimingLogger:
 
 timing_logger = TimingLogger()
 
-def process_agent_decision(agent, env, rl_recommendations):
+def process_agent_decision(agent, env, rl_recommendations, negotiation_history=None):
     """Helper to generate observation and get orders in a separate thread."""
     timing_logger.log("START_DECISION", agent.power_name)
     
@@ -170,6 +170,9 @@ def process_agent_decision(agent, env, rl_recommendations):
     timing_logger.log("OBS_GENERATED", agent.power_name)
     
     obs['rl_recommendations'] = rl_recommendations
+    if negotiation_history:
+        obs['negotiation_history'] = negotiation_history
+        
     res = agent.decide_orders(obs)
     
     timing_logger.log("END_DECISION", agent.power_name)
@@ -619,7 +622,7 @@ def run_negotiation_phase(env, agents, turn_index, rl_recommendations, negotiati
     for p in inbox:
         inbox[p] = []
 
-    return negotiation_log_for_turn
+    return negotiation_log_for_turn, inbox_history
 
 
 def setup_new_game(game_id, negotiation_subrounds, test_power=None, map_name_or_path=None, debug_prompts=False, max_turns=50):
@@ -932,9 +935,11 @@ def main():
         # Movement phases
         if phase_type == 'M':
             logger.info("=== MOVEMENT PHASE ===")
+            
+            phase_inbox_history = None
             if args.negotiate:
                 logger.info("Starting negotiation rounds...")
-                negotiation_log = run_negotiation_phase(
+                negotiation_log, phase_inbox_history = run_negotiation_phase(
                     env,
                     agents,
                     turn_count,
@@ -955,8 +960,11 @@ def main():
                     if engine_power.is_eliminated():
                         logger.info(f"{power_code} is eliminated, skipping orders.")
                         continue
-                    obs = env.get_observation_for_power(power_code)
-                    fut = executor.submit(process_agent_decision, agent, env, rl_recommendations)
+                    # obs = env.get_observation_for_power(power_code) # Moved inside process_agent_decision
+                    
+                    neg_hist = phase_inbox_history.get(power_code, []) if phase_inbox_history else None
+                    
+                    fut = executor.submit(process_agent_decision, agent, env, rl_recommendations, neg_hist)
                     future_orders_map[fut] = power_code
 
                 for fut in concurrent.futures.as_completed(future_orders_map):

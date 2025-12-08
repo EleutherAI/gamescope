@@ -5,6 +5,7 @@ import shutil
 import pickle
 from contextlib import nullcontext
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -17,7 +18,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils import PreTrainedTokenizer
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
 
 
 DATA_BASE_URL = "https://raw.githubusercontent.com/DenisPeskoff/2020_acl_diplomacy/master/data"
@@ -48,15 +50,19 @@ def _ensure_dataset_files() -> dict[str, Path]:
 
 
 def _normalize_truth_label(raw_label: object) -> Optional[bool]:
+    """Normalize various truth/deception label formats to bool.
+
+    Returns True for truthful, False for deceptive, None for unknown.
+    """
     if isinstance(raw_label, bool):
         return raw_label
     if raw_label is None:
         return None
     if isinstance(raw_label, str):
         normalized = raw_label.strip().lower()
-        if normalized in {"true", "truth", "truthful"}:
+        if normalized in {"true", "truth", "truthful", "honest"}:
             return True
-        if normalized in {"false", "lie", "lying", "deceptive"}:
+        if normalized in {"false", "lie", "lying", "deceptive", "deception"}:
             return False
     return None
 
@@ -82,30 +88,184 @@ def _iter_dataset_examples(paths: dict[str, Path], splits: Iterable[str]) -> Ite
                     yield text, 0 if truth_value else 1
 
 
-def load_diplomacy_dataset() -> Tuple[List[str], np.ndarray]:
+CONFIDENCE_LEVELS = {"high": 3, "medium": 2, "low": 1}
+
+
+@dataclass
+class ProbeExample:
+    """An example for probe training with optional span marking."""
+    context: str  # Full text to feed to model
+    probe_span: Optional[str] = None  # Text span to extract representations from (if None, use full context)
+    label: int = 0  # 0 = truthful, 1 = deceptive
+
+
+def load_diplomacy_dataset(
+    dataset_path: Optional[str] = None,
+    min_confidence: Optional[str] = None,
+) -> Tuple[List[ProbeExample], np.ndarray]:
+    """Load diplomacy deception dataset.
+
+    If dataset_path is provided, loads from that JSONL file.
+    Otherwise, downloads and uses the original ACL 2020 diplomacy dataset.
+
+    Args:
+        dataset_path: Path to custom JSONL dataset
+        min_confidence: Minimum confidence level to include ("high", "medium", "low").
+                       If None, includes all examples.
+
+    Returns:
+        List of ProbeExample objects and numpy array of labels.
+
+    Supports multiple formats:
+    - wes_deception_dataset: {context, label, confidence, wes_final_statements, ...}
+    - ACL 2020 format: {messages, sender_labels}
+    - Simple format: {text, label}
+    """
+    min_conf_val = CONFIDENCE_LEVELS.get(min_confidence, 0) if min_confidence else 0
+
+    if dataset_path is not None:
+        # Load from custom JSONL file
+        examples: List[ProbeExample] = []
+        labels: List[int] = []
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+
+                # Format 1: wes_deception_dataset (game-level with context + label)
+                if "context" in record and "label" in record:
+                    # Check confidence filter
+                    conf = record.get("confidence", "high")
+                    if CONFIDENCE_LEVELS.get(conf, 0) < min_conf_val:
+                        continue
+
+                    truth_value = _normalize_truth_label(record["label"])
+                    if truth_value is None:
+                        continue
+
+                    context = record["context"].strip()
+                    if not context:
+                        continue
+
+                    # Extract missive bodies for span-based probing
+                    statements = record.get("wes_final_statements", [])
+                    if statements:
+                        missive_texts = [s.get("body", "") for s in statements if s.get("body")]
+                        probe_span = " ".join(missive_texts).strip() if missive_texts else None
+                    else:
+                        probe_span = None
+
+                    label_int = 0 if truth_value else 1
+                    examples.append(ProbeExample(context=context, probe_span=probe_span, label=label_int))
+                    labels.append(label_int)
+
+                # Format 2: Simple text/label pairs
+                elif "text" in record and "label" in record:
+                    text = record["text"].strip()
+                    truth_value = _normalize_truth_label(record["label"])
+                    if text and truth_value is not None:
+                        label_int = 0 if truth_value else 1
+                        examples.append(ProbeExample(context=text, probe_span=None, label=label_int))
+                        labels.append(label_int)
+
+                # Format 3: ACL 2020 style with messages/sender_labels arrays
+                elif "messages" in record:
+                    messages = record.get("messages") or []
+                    sender_labels = record.get("sender_labels") or []
+                    for message, lbl in zip(messages, sender_labels):
+                        text = (message or "").strip()
+                        truth_value = _normalize_truth_label(lbl)
+                        if text and truth_value is not None:
+                            label_int = 0 if truth_value else 1
+                            examples.append(ProbeExample(context=text, probe_span=None, label=label_int))
+                            labels.append(label_int)
+
+        return examples, np.array(labels, dtype=np.int64)
+
+    # Default: use original ACL 2020 dataset
     paths = _ensure_dataset_files()
-    texts: List[str] = []
-    labels: List[int] = []
+    examples = []
+    labels = []
     for text, label in _iter_dataset_examples(paths, ("train", "validation")):
-        texts.append(text)
+        examples.append(ProbeExample(context=text, probe_span=None, label=label))
         labels.append(label)
-    return texts, np.array(labels, dtype=np.int64)
+    return examples, np.array(labels, dtype=np.int64)
+
+
+def _find_span_token_mask(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    probe_spans: List[Optional[str]],
+    tokenizer: PreTrainedTokenizer,
+) -> torch.Tensor:
+    """Create a mask for tokens corresponding to probe_span text.
+
+    For each example in the batch, finds tokens that correspond to the probe_span
+    text and creates a mask. If probe_span is None, uses the full attention_mask.
+
+    Returns:
+        Tensor of shape (batch, seq_len) with 1s for probe span tokens.
+    """
+    batch_size, seq_len = input_ids.shape
+    span_mask = torch.zeros_like(attention_mask)
+
+    for i, probe_span in enumerate(probe_spans):
+        if probe_span is None:
+            # No span specified, use full sequence
+            span_mask[i] = attention_mask[i]
+        else:
+            # Tokenize the probe span to find its tokens
+            span_tokens = tokenizer.encode(probe_span, add_special_tokens=False)
+            if not span_tokens:
+                # Fallback to full sequence if span tokenizes to nothing
+                span_mask[i] = attention_mask[i]
+                continue
+
+            # Search for the span tokens in the input_ids
+            input_list = input_ids[i].tolist()
+            span_len = len(span_tokens)
+
+            # Find all occurrences and use the last one (most likely the actual output)
+            last_match_start = -1
+            for j in range(len(input_list) - span_len + 1):
+                if input_list[j:j + span_len] == span_tokens:
+                    last_match_start = j
+
+            if last_match_start >= 0:
+                span_mask[i, last_match_start:last_match_start + span_len] = 1
+            else:
+                # Span not found exactly - try partial match or fallback
+                # This can happen due to tokenization differences
+                # Fallback: use full sequence
+                span_mask[i] = attention_mask[i]
+
+    return span_mask
 
 
 @torch.inference_mode()
 def compute_representations(
-    texts: List[str],
+    examples: List[ProbeExample],
     tokenizer: PreTrainedTokenizer,
     model: PreTrainedModel,
     device: torch.device,
     batch_size: int = 8,
     max_length: int = 512,
 ) -> np.ndarray:
+    """Compute representations for probe examples.
+
+    If an example has a probe_span, extracts representations only from those tokens.
+    Otherwise, uses mean pooling over the full sequence.
+    """
     features: List[np.ndarray] = []
     model.eval()
-    for start in range(0, len(texts), batch_size):
-        end = min(start + batch_size, len(texts))
-        batch_texts = texts[start:end]
+    for start in range(0, len(examples), batch_size):
+        end = min(start + batch_size, len(examples))
+        batch_examples = examples[start:end]
+        batch_texts = [ex.context for ex in batch_examples]
+        batch_spans = [ex.probe_span for ex in batch_examples]
+
         encoded = tokenizer(
             batch_texts,
             padding=True,
@@ -114,16 +274,25 @@ def compute_representations(
             return_tensors="pt",
         )
         encoded = {k: v.to(device) for k, v in encoded.items()}
+
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             outputs = model(**encoded, output_hidden_states=True)
+
         hidden_states = outputs.hidden_states[-2]
-        attention_mask = encoded["attention_mask"].unsqueeze(-1)
-        masked_hidden = hidden_states * attention_mask
-        token_counts = attention_mask.sum(dim=1).clamp(min=1)
-        
-        # TODO add option to probe at the final token
+
+        # Create span mask for selective pooling
+        span_mask = _find_span_token_mask(
+            encoded["input_ids"],
+            encoded["attention_mask"],
+            batch_spans,
+            tokenizer,
+        ).unsqueeze(-1).to(device)
+
+        masked_hidden = hidden_states * span_mask
+        token_counts = span_mask.sum(dim=1).clamp(min=1)
         pooled = (masked_hidden.sum(dim=1) / token_counts).float()
         features.append(pooled.cpu().numpy())
+
     return np.concatenate(features, axis=0)
 
 
@@ -157,6 +326,10 @@ def main(
     device_arg: Optional[str],
     model_name: str,
     output_path: str,
+    lora_path: Optional[str] = None,
+    dataset_path: Optional[str] = None,
+    test_dataset_path: Optional[str] = None,
+    min_confidence: Optional[str] = None,
 ):
     if device_arg is not None:
         device = torch.device(device_arg)
@@ -170,37 +343,76 @@ def main(
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
-    model = AutoModel.from_pretrained(
-        model_name,
-        output_hidden_states=True,
-        device_map="auto",
-    )
+
+    # Use AutoModelForCausalLM when loading LoRA (trained on causal LM),
+    # otherwise use AutoModel for base representations
+    if lora_path is not None:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            output_hidden_states=True,
+            device_map="auto",
+        )
+        logging.info("Loading LoRA adapter from %s", lora_path)
+        model = PeftModel.from_pretrained(model, lora_path)
+    else:
+        model = AutoModel.from_pretrained(
+            model_name,
+            output_hidden_states=True,
+            device_map="auto",
+        )
     if model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
-    logging.info("Loading deception dataset")
-    texts, labels = load_diplomacy_dataset()
-    logging.info("Loaded %d labelled utterances", len(texts))
+    logging.info("Loading training dataset")
+    train_examples, train_labels = load_diplomacy_dataset(dataset_path, min_confidence)
+    logging.info("Loaded %d labelled training examples", len(train_examples))
 
-    X_train_texts, X_test_texts, y_train, y_test = train_test_split(
-        texts,
-        labels,
-        test_size=test_size,
-        random_state=seed,
-        stratify=labels,
-    )
+    # Log class balance
+    n_truthful = (train_labels == 0).sum()
+    n_deceptive = (train_labels == 1).sum()
+    logging.info("Train class balance: %d truthful, %d deceptive", n_truthful, n_deceptive)
+
+    # Log span coverage
+    n_with_span = sum(1 for ex in train_examples if ex.probe_span is not None)
+    logging.info("Train examples with probe spans: %d / %d", n_with_span, len(train_examples))
+
+    if test_dataset_path is not None:
+        # Use separate test dataset
+        logging.info("Loading test dataset from %s", test_dataset_path)
+        test_examples, test_labels = load_diplomacy_dataset(test_dataset_path, min_confidence)
+        logging.info("Loaded %d labelled test examples", len(test_examples))
+
+        n_truthful_test = (test_labels == 0).sum()
+        n_deceptive_test = (test_labels == 1).sum()
+        logging.info("Test class balance: %d truthful, %d deceptive", n_truthful_test, n_deceptive_test)
+
+        n_with_span_test = sum(1 for ex in test_examples if ex.probe_span is not None)
+        logging.info("Test examples with probe spans: %d / %d", n_with_span_test, len(test_examples))
+
+        X_train_examples = train_examples
+        y_train = train_labels
+        X_test_examples = test_examples
+        y_test = test_labels
+    else:
+        # Split training dataset
+        X_train_examples, X_test_examples, y_train, y_test = train_test_split(
+            train_examples,
+            train_labels,
+            test_size=test_size,
+            random_state=seed,
+            stratify=train_labels,
+        )
 
     logging.info(
         "Encoding %d training and %d evaluation examples",
-        len(X_train_texts),
-        len(X_test_texts),
+        len(X_train_examples),
+        len(X_test_examples),
     )
     X_train = compute_representations(
-        X_train_texts, tokenizer, model, device, batch_size, max_length
+        X_train_examples, tokenizer, model, device, batch_size, max_length
     )
     X_test = compute_representations(
-        X_test_texts, tokenizer, model, device, batch_size, max_length
+        X_test_examples, tokenizer, model, device, batch_size, max_length
     )
 
     logging.info("Scaling features")
@@ -292,6 +504,31 @@ if __name__ == "__main__":
         default="probe.pkl",
         help="Path to save the trained probe (pickle)",
     )
+    parser.add_argument(
+        "--lora-path",
+        type=str,
+        default=None,
+        help="Path to LoRA adapter checkpoint (optional)",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Path to training JSONL dataset (optional, defaults to ACL 2020 diplomacy)",
+    )
+    parser.add_argument(
+        "--test-dataset",
+        type=str,
+        default=None,
+        help="Path to separate test JSONL dataset (optional, if not provided splits --dataset)",
+    )
+    parser.add_argument(
+        "--min-confidence",
+        type=str,
+        default=None,
+        choices=["high", "medium", "low"],
+        help="Minimum confidence level to include (high > medium > low)",
+    )
     args = parser.parse_args()
 
     main(
@@ -302,4 +539,8 @@ if __name__ == "__main__":
         device_arg=args.device,
         model_name=args.model_name,
         output_path=args.output_path,
+        lora_path=args.lora_path,
+        dataset_path=args.dataset,
+        test_dataset_path=args.test_dataset,
+        min_confidence=args.min_confidence,
     )

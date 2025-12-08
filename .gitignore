@@ -118,3 +118,6 @@ AGENTS.md
 gamestate_renders/*
 
 *.svg
+CLAUDE.md
+scripts/*
+scratch/*

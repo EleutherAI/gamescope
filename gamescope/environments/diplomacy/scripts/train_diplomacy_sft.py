@@ -10,7 +10,7 @@ The dataset format is JSONL with keys:
   - completion: JSON string with reasoning and orders/messages
 
 Example:
-    python scripts/train_diplomacy_sft.py \
+    python -m gamescope.environments.diplomacy.scripts.train_diplomacy_sft \
         --model_name_or_path Qwen/Qwen3-8B \
         --dataset_path results/diplomacy/sft/merged_dataset.jsonl \
         --output_dir results/diplomacy/sft/qwen_diplomacy_sft
@@ -31,9 +31,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# Ensure repo root is importable
+# Resolve repo root from this file's location
 _THIS_FILE = Path(__file__).resolve()
-_REPO_ROOT = _THIS_FILE.parents[1]
+_REPO_ROOT = _THIS_FILE.parents[4]  # gamescope/environments/diplomacy/scripts -> root
 if str(_REPO_ROOT) not in sys.path:
     sys.path.append(str(_REPO_ROOT))
 

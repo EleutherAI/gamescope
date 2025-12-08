@@ -4,12 +4,18 @@ import json
 import logging
 import argparse
 from typing import List, Dict, Any
+from pathlib import Path
+
+# Resolve repo root from this file's location
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parents[4]  # gamescope/environments/diplomacy/scripts -> root
 
 # Add relevant paths to sys.path
-sys.path.append(os.path.abspath("gamescope/environments/diplomacy/vendor/diplobench"))
+if str(_REPO_ROOT / "gamescope/environments/diplomacy/vendor/diplobench") not in sys.path:
+    sys.path.append(str(_REPO_ROOT / "gamescope/environments/diplomacy/vendor/diplobench"))
 
-# Also ensure repo root is in sys.path (it should be by default if running from root, but explicit is safe)
-sys.path.append(os.path.abspath("."))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
 
 try:
     from diplomacy_game.environment import DiplomacyEnvironment
@@ -47,14 +53,12 @@ def reconstruct_prompt(log_path: str, power: str, phase_name: str, subround: int
     
     # 1. Environment State & Adjudication (The "One-Step Back" Trick)
     # If not the first turn, load N-1 and step forward to generate outcomes text
-    map_path = "gamescope/environments/diplomacy/maps/treaty_of_verdun.map" # Default/Assumed
-    if not os.path.exists(map_path):
-        # Try finding it relative to current dir or script
-        if os.path.exists("../gamescope/environments/diplomacy/maps/treaty_of_verdun.map"):
-            map_path = "../gamescope/environments/diplomacy/maps/treaty_of_verdun.map"
-        else:
-            # print(f"Warning: Map file {map_path} not found. Using 'standard'.")
-            map_path = 'standard'
+    map_path = _REPO_ROOT / "gamescope/environments/diplomacy/maps/treaty_of_verdun.map"
+    if not map_path.exists():
+        # Fallback to standard map
+        map_path = 'standard'
+    else:
+        map_path = str(map_path)
             
     env = DiplomacyEnvironment(map_name_or_path=map_path)
     
@@ -136,8 +140,15 @@ def reconstruct_prompt(log_path: str, power: str, phase_name: str, subround: int
              raw_subrounds = neg_entry.get('subrounds', [])
              for sr in raw_subrounds:
                  if sr['subround_index'] < subround:
-                     inbox_history.append(sr)
-        
+                     # Transform to format expected by format_inbox_history
+                     sent = [msg for msg in sr['sent_missives'] if msg['sender'] == power]
+                     received = sr['received_missives'].get(power, [])
+                     inbox_history.append({
+                         "subround_index": sr['subround_index'],
+                         "sent_missives": sent,
+                         "received_missives": received
+                     })
+
         formatted_inbox = agent.format_inbox_history(inbox_history)
         prompt = generate_negotiation_prompt(agent, observation, subround, formatted_inbox)
         return prompt
@@ -155,14 +166,49 @@ def reconstruct_prompt(log_path: str, power: str, phase_name: str, subround: int
         inbox_history = []
         if neg_entry:
              # For summary, we want the FULL history of this phase
-             inbox_history = neg_entry.get('subrounds', [])
-        
+             raw_subrounds = neg_entry.get('subrounds', [])
+             for sr in raw_subrounds:
+                 sent = [msg for msg in sr['sent_missives'] if msg['sender'] == power]
+                 received = sr['received_missives'].get(power, [])
+                 inbox_history.append({
+                     "subround_index": sr['subround_index'],
+                     "sent_missives": sent,
+                     "received_missives": received
+                 })
+
         formatted_inbox = agent.format_inbox_history(inbox_history)
         prompt = generate_summary_prompt(agent, observation, formatted_inbox)
         return prompt
         
     else:
         # Orders Prompt
+        
+        # Inject full negotiation history for this phase if available
+        neg_entry = None
+        for entry in negotiation_history:
+            if entry['phase'] == phase_name:
+                neg_entry = entry
+                break
+        
+        if neg_entry:
+            # Reconstruct per-agent inbox history from subrounds
+            inbox_history = []
+            raw_subrounds = neg_entry.get('subrounds', [])
+            for sr in raw_subrounds:
+                sub_i = sr['subround_index']
+                # Filter sent/received for THIS power
+                sent = [msg for msg in sr['sent_missives'] if msg['sender'] == power]
+                received = sr['received_missives'].get(power, [])
+                
+                if sent or received:
+                    inbox_history.append({
+                        "subround_index": sub_i,
+                        "sent_missives": sent,
+                        "received_missives": received
+                    })
+            
+            observation['negotiation_history'] = inbox_history
+
         prompt_only = agent.build_prompt_orders_only(observation)
         
         # System prompt logic

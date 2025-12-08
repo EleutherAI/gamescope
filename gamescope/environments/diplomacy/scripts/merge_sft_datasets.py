@@ -4,7 +4,7 @@ Handles deduplication based on (game_id, phase, power, type) tuple.
 Outputs merged dataset to a specified location.
 
 Example:
-    python scripts/merge_sft_datasets.py \
+    python -m gamescope.environments.diplomacy.scripts.merge_sft_datasets \
         --input_files results/diplomacy/sft/dataset_gen/*/sft_dataset.jsonl \
         --output_file results/diplomacy/sft/merged_dataset.jsonl
 """

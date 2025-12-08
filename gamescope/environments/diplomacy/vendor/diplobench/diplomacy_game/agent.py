@@ -280,6 +280,14 @@ IMPORTANT: These may or may not not align with your diplomatic goals. Feel free 
 {observation["rl_recommendations"][self.power_name]}
 """
 
+        negotiation_history_block = ""
+        if "negotiation_history" in observation and observation["negotiation_history"]:
+            formatted_neg = self.format_inbox_history(observation["negotiation_history"])
+            negotiation_history_block = f"""
+=== NEGOTIATION HISTORY (THIS PHASE) ===
+{formatted_neg}
+"""
+
         if phase_type == "M":
             order_syntax = (
                 "Movement phase order formats:\n"
@@ -336,6 +344,7 @@ Current phase: {phase}
 {engine_recommendations}
 === RECENT PRIVATE JOURNAL ===
 {formatted_journal}
+{negotiation_history_block}
 {misinformation}
 === ORDER SYNTAX ===
 {order_syntax}

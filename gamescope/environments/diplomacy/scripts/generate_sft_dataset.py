@@ -7,22 +7,19 @@ from glob import glob
 from tqdm import tqdm
 from pathlib import Path
 
-# Ensure we can import reconstruct_turn
-sys.path.append(os.path.abspath("scripts"))
-# Ensure we can import diplomacy_game
-sys.path.append(os.path.abspath("gamescope/environments/diplomacy/vendor/diplobench"))
-# Ensure we can import gamescope
-sys.path.append(os.path.abspath("."))
-
-# Ensure repo root is importable so `gamescope.libs.*` works even if cwd changes
+# Resolve repo root from this file's location
 _THIS_FILE = Path(__file__).resolve()
-_REPO_ROOT = _THIS_FILE.parents[1] # Assuming scripts/ is one level deep, wait. scripts/ is in root? 
-# "scripts/generate_sft_dataset.py" -> parents[1] is root.
+_REPO_ROOT = _THIS_FILE.parents[4]  # gamescope/environments/diplomacy/scripts -> root
+
+# Add relevant paths to sys.path
+if str(_REPO_ROOT / "gamescope/environments/diplomacy/vendor/diplobench") not in sys.path:
+    sys.path.append(str(_REPO_ROOT / "gamescope/environments/diplomacy/vendor/diplobench"))
+
 if str(_REPO_ROOT) not in sys.path:
     sys.path.append(str(_REPO_ROOT))
 
 try:
-    from reconstruct_turn import reconstruct_prompt
+    from gamescope.environments.diplomacy.scripts.reconstruct_turn import reconstruct_prompt
     from diplomacy_game.llm import generate
     from gamescope.libs.run_utils import run_context
 except ImportError as e:
