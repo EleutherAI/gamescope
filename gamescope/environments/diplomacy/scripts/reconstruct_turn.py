@@ -386,6 +386,125 @@ Compose your summary now according to the instructions.
     return f"SYSTEM:\n{system_text}\n\nUSER:\n{prompt_text}"
 
 
+def generate_journal_after_orders_prompt(agent, observation, reasoning, orders):
+    """
+    Generate the journal_after_orders prompt - called after orders are decided.
+
+    Args:
+        agent: LLMAgent instance
+        observation: Game observation dict
+        reasoning: List of reasoning strings (from decide_orders)
+        orders: List of order strings (from decide_orders)
+    """
+    phase = observation["phase"]
+
+    prompt_text = f"""
+=== PHASE & POWER ===
+Phase: {phase}
+Your Power: {agent.power_name}
+
+=== GAME STATE ===
+{json.dumps(observation.get("board_state", {}), indent=2)}
+
+=== STRATEGIC OVERVIEW ===
+{observation["strategic_overview"]}
+
+=== REASONING (ALREADY PRODUCED) ===
+{reasoning}
+
+=== FINAL ORDERS (ALREADY DECIDED) ===
+{orders}
+
+=== INSTRUCTIONS ===
+Update your private journal, briefly noting your observations and the move. Return JSON:
+{{
+  "journal_update": ["...", "..."]
+}}
+"""
+
+    system_text = (
+        "You are an AI Diplomacy player. You have ALREADY decided on your orders. "
+        "Now you must produce a private journal update. Summarize your thoughts in short bullet points. "
+        "Do not repeat the 'reasoning' verbatim, but you may reference it to expand your private perspective. "
+        "Return valid JSON with exactly one key: 'journal_update' (list of strings)."
+    )
+
+    return f"SYSTEM:\n{system_text}\n\nUSER:\n{prompt_text}"
+
+
+def reconstruct_journal_after_orders_prompt(log_path: str, power: str, phase_name: str, reasoning: list = None) -> str:
+    """
+    Reconstruct the journal_after_orders prompt for a specific phase.
+
+    Since reasoning is not stored in game logs, caller must provide it or a placeholder will be used.
+    """
+    with open(log_path, 'r') as f:
+        data = json.load(f)
+
+    turn_history = data['turn_history']
+
+    # Find the target phase
+    phase_idx = -1
+    for i, entry in enumerate(turn_history):
+        if entry['phase'] == phase_name:
+            phase_idx = i
+            break
+
+    if phase_idx == -1:
+        return ""
+
+    target_phase_data = turn_history[phase_idx]
+
+    # Get orders for this power
+    orders = target_phase_data.get('issued_orders', {}).get(power, [])
+    if not orders:
+        return ""
+
+    # Use provided reasoning or placeholder
+    if reasoning is None:
+        reasoning = ["[Reasoning not stored in game logs]"]
+
+    # Load environment state
+    map_path = _REPO_ROOT / "gamescope/environments/diplomacy/maps/treaty_of_verdun.map"
+    if not map_path.exists():
+        map_path = 'standard'
+    else:
+        map_path = str(map_path)
+
+    env = DiplomacyEnvironment(map_name_or_path=map_path)
+
+    # Load state for this phase
+    if phase_idx > 0:
+        prev_data = turn_history[phase_idx - 1]
+        prev_state = prev_data['env_state']
+        accepted_orders = prev_data['accepted_orders']
+
+        env.game.set_state(prev_state)
+        for pwr, pwr_orders in accepted_orders.items():
+            if pwr_orders:
+                env.set_orders(pwr, pwr_orders)
+        env.step()
+    else:
+        env.game.set_state(target_phase_data['env_state'])
+
+    # Get agent info
+    agents_data = data['agents_data']
+    if power not in agents_data:
+        return ""
+
+    agent_info = agents_data[power]
+    personality = agent_info['personality']
+    goals = agent_info.get('goals', [])
+
+    # Instantiate agent (journal not needed for this prompt)
+    agent = LLMAgent(power, personality, goals, journal=[])
+
+    # Get observation
+    observation = env.get_observation_for_power(power)
+
+    return generate_journal_after_orders_prompt(agent, observation, reasoning, orders)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", required=True)

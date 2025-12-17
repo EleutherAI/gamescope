@@ -19,7 +19,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.append(str(_REPO_ROOT))
 
 try:
-    from gamescope.environments.diplomacy.scripts.reconstruct_turn import reconstruct_prompt
+    from gamescope.environments.diplomacy.scripts.reconstruct_turn import (
+        reconstruct_prompt,
+        generate_journal_after_orders_prompt,
+    )
     from diplomacy_game.llm import generate
     from gamescope.libs.run_utils import run_context
 except ImportError as e:
@@ -97,7 +100,64 @@ def process_log(log_path, output_file, model_name, subrounds_per_phase=3, dry_ru
                     }
                     with open(output_file, 'a') as f:
                         f.write(json.dumps(record) + "\n")
-                    
+
+                    # 1b. Generate journal_after_orders using the reasoning from orders
+                    try:
+                        # Parse the orders completion to get reasoning and orders
+                        orders_data = json.loads(completion)
+                        reasoning = orders_data.get("reasoning", [])
+                        orders = orders_data.get("orders", [])
+
+                        # We need observation for the prompt - reconstruct it
+                        # For now, we'll use a simplified approach: generate prompt with extracted data
+                        # This requires loading the game state, which is expensive
+                        # So we use the existing reconstruct infrastructure
+
+                        from gamescope.environments.diplomacy.scripts.reconstruct_turn import (
+                            reconstruct_journal_after_orders_prompt as rjao
+                        )
+
+                        jao_prompt = rjao(log_path, power, phase, reasoning=reasoning)
+
+                        if jao_prompt:
+                            parts = jao_prompt.split("USER:\n")
+                            if len(parts) == 2:
+                                jao_system = parts[0].replace("SYSTEM:\n", "").strip()
+                                jao_user = parts[1].strip()
+                            else:
+                                jao_system = ""
+                                jao_user = jao_prompt
+
+                            if dry_run:
+                                logger.info(f"[DRY RUN] Would generate journal_after_orders for {game_id} {phase} {power}")
+                                jao_completion = "DRY_RUN_COMPLETION"
+                            else:
+                                logger.info(f"Generating journal_after_orders for {game_id} {phase} {power}")
+                                jao_completion = generate(
+                                    prompt_text=jao_user,
+                                    system_text=jao_system,
+                                    model_name=model_name,
+                                    temperature=0.7
+                                )
+
+                            if jao_completion:
+                                jao_record = {
+                                    "game_id": game_id,
+                                    "phase": phase,
+                                    "power": power,
+                                    "type": "journal_after_orders",
+                                    "prompt": jao_prompt,
+                                    "completion": jao_completion,
+                                    "model": model_name
+                                }
+                                with open(output_file, 'a') as f:
+                                    f.write(json.dumps(jao_record) + "\n")
+
+                    except json.JSONDecodeError:
+                        logger.warning(f"Could not parse orders completion for journal_after_orders: {phase} {power}")
+                    except Exception as e:
+                        logger.error(f"Error generating journal_after_orders {phase} {power}: {e}")
+
             except Exception as e:
                 logger.error(f"Error processing {phase} {power} orders: {e}")
 

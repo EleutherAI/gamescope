@@ -76,15 +76,22 @@ class DiplomacySFTDataset(Dataset):
         dataset_path: Path,
         max_records: Optional[int] = None,
         filter_type: Optional[str] = None,
+        items: Optional[List[DiplomacySample]] = None,
     ) -> None:
-        """Load dataset from JSONL file.
+        """Load dataset from JSONL file or from pre-loaded items.
 
         Args:
-            dataset_path: Path to JSONL file
+            dataset_path: Path to JSONL file (ignored if items provided)
             max_records: Maximum number of records to load (None for all)
             filter_type: Filter to specific type ("orders" or "negotiation")
+            items: Pre-loaded items (for creating splits)
         """
-        items: List[DiplomacySample] = []
+        if items is not None:
+            self._items = items
+            logger.info(f"Created dataset with {len(items)} pre-loaded samples")
+            return
+
+        items_list: List[DiplomacySample] = []
 
         with open(dataset_path, "r") as f:
             for line in f:
@@ -99,7 +106,7 @@ class DiplomacySFTDataset(Dataset):
                 if filter_type and sample_type != filter_type:
                     continue
 
-                items.append(
+                items_list.append(
                     DiplomacySample(
                         game_id=record.get("game_id", "unknown"),
                         phase=record.get("phase", ""),
@@ -110,17 +117,49 @@ class DiplomacySFTDataset(Dataset):
                     )
                 )
 
-                if max_records is not None and len(items) >= max_records:
+                if max_records is not None and len(items_list) >= max_records:
                     break
 
-        self._items = items
-        logger.info(f"Loaded {len(items)} samples from {dataset_path}")
+        self._items = items_list
+        logger.info(f"Loaded {len(items_list)} samples from {dataset_path}")
 
     def __len__(self) -> int:
         return len(self._items)
 
     def __getitem__(self, idx: int) -> DiplomacySample:
         return self._items[idx]
+
+    def train_eval_split(
+        self, eval_ratio: float = 0.1, seed: int = 42
+    ) -> tuple["DiplomacySFTDataset", "DiplomacySFTDataset"]:
+        """Split dataset into train and eval sets.
+
+        Args:
+            eval_ratio: Fraction of data for eval (default 10%)
+            seed: Random seed for reproducibility
+
+        Returns:
+            (train_dataset, eval_dataset)
+        """
+        rng = np.random.default_rng(seed)
+        indices = rng.permutation(len(self._items))
+        eval_size = int(len(self._items) * eval_ratio)
+
+        eval_indices = indices[:eval_size]
+        train_indices = indices[eval_size:]
+
+        train_items = [self._items[i] for i in train_indices]
+        eval_items = [self._items[i] for i in eval_indices]
+
+        train_dataset = DiplomacySFTDataset(
+            dataset_path=Path("."), items=train_items
+        )
+        eval_dataset = DiplomacySFTDataset(
+            dataset_path=Path("."), items=eval_items
+        )
+
+        logger.info(f"Split: {len(train_items)} train, {len(eval_items)} eval")
+        return train_dataset, eval_dataset
 
 
 def parse_prompt_parts(prompt: str) -> tuple[str, str]:
@@ -297,6 +336,18 @@ def main() -> None:
         action="store_true",
         help="Load data and model but don't train (for testing).",
     )
+    parser.add_argument(
+        "--eval_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of data to use for evaluation (default 0.1).",
+    )
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=25,
+        help="Run evaluation every N steps (default 30).",
+    )
 
     args = parser.parse_args()
 
@@ -380,11 +431,14 @@ def main() -> None:
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Load dataset
-    dataset = DiplomacySFTDataset(
+    # Load dataset and create train/eval split
+    full_dataset = DiplomacySFTDataset(
         dataset_path=Path(args.dataset_path),
         max_records=args.num_train_data,
         filter_type=args.filter_type,
+    )
+    train_dataset, eval_dataset = full_dataset.train_eval_split(
+        eval_ratio=args.eval_ratio, seed=args.seed
     )
 
     collator = DiplomacyCollator(
@@ -396,7 +450,7 @@ def main() -> None:
     if args.dry_run:
         logger.info("Dry run - testing data loading and model setup")
         # Test a batch
-        test_batch = [dataset[i] for i in range(min(2, len(dataset)))]
+        test_batch = [train_dataset[i] for i in range(min(2, len(train_dataset)))]
         test_output = collator(test_batch)
         logger.info(f"Test batch shapes: {test_output['input_ids'].shape}")
         logger.info("Dry run complete - exiting without training")
@@ -406,6 +460,7 @@ def main() -> None:
         output_dir=args.output_dir,
         overwrite_output_dir=True,
         per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_train_epochs,
         learning_rate=args.learning_rate,
@@ -413,8 +468,12 @@ def main() -> None:
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="cosine",
         logging_steps=10,
+        eval_strategy="steps",
+        eval_steps=args.eval_steps,
         save_steps=100,
-        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         bf16=True,
         gradient_checkpointing=True,
         dataloader_pin_memory=False,
@@ -424,7 +483,8 @@ def main() -> None:
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         data_collator=collator,
     )

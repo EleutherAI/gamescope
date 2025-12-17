@@ -338,7 +338,8 @@ def run_negotiation_phase(env, agents, turn_index, rl_recommendations, negotiati
         # Now that we have all messages, we apply the probe logic to modify/annotate them BEFORE distribution.
         
         # Player Mode: Probe the target's messages
-        if probe_ctx is not None and probe_power in new_missives_by_power and probe_direction == "player":
+        # Allow probe logic if we have a probe context OR if using random outputs
+        if (probe_ctx is not None or random_probe_outputs) and probe_power in new_missives_by_power and probe_direction == "player":
             probed_messages = new_missives_by_power[probe_power]
             
             # Filter valid messages for probing
@@ -382,15 +383,19 @@ def run_negotiation_phase(env, agents, turn_index, rl_recommendations, negotiati
                     message_long_labels.append(long)
 
                 # Prepend tag to each corresponding message body in the OUTBOX
-                for (idx, _rcps, _body), long_label in zip(non_empty, message_long_labels):
-                    # Store assessment in metadata instead of modifying body in-place
-                    probed_messages[idx]["probe_assessment"] = long_label
+                # Only add assessment if probe classifies as deceptive (y=1)
+                for (idx, _rcps, _body), long_label, res in zip(non_empty, message_long_labels, results):
+                    if res.get('y', 0) == 1:  # Only annotate deceptive messages
+                        # Store assessment in metadata instead of modifying body in-place
+                        probed_messages[idx]["probe_assessment"] = long_label
 
-                # Update annotations for the NEXT round context
+                # Update annotations for the NEXT round context (only for deceptive messages)
                 # Target: Opponents. The player's messages are being assessed, so opponents should see this.
                 recipient_set = [rcp for rcp in agents.keys() if rcp != probe_power]
                 labels_by_recipient = {rcp: [] for rcp in recipient_set}
-                for (i, rcps, _body), short_label in zip(non_empty, message_short_labels):
+                for (i, rcps, _body), short_label, res in zip(non_empty, message_short_labels, results):
+                    if res.get('y', 0) != 1:  # Skip truthful messages
+                        continue
                     if "ALL" in rcps:
                         for rcp in recipient_set:
                             labels_by_recipient[rcp].append(short_label)
@@ -398,7 +403,7 @@ def run_negotiation_phase(env, agents, turn_index, rl_recommendations, negotiati
                         for rcp in rcps:
                             if rcp in labels_by_recipient:
                                 labels_by_recipient[rcp].append(short_label)
-                
+
                 for rcp, labels in labels_by_recipient.items():
                     if labels:
                         # Append to existing annotations or create new
@@ -408,7 +413,7 @@ def run_negotiation_phase(env, agents, turn_index, rl_recommendations, negotiati
                         #print(new_ann) # Log for visibility
 
         # Opponents Mode: Probe everyone else's messages targeting the probe_power
-        elif probe_ctx is not None and probe_power in agents and probe_direction == "opponents":
+        elif (probe_ctx is not None or random_probe_outputs) and probe_power in agents and probe_direction == "opponents":
              # Collect opponents' non-empty messages for classification
             message_refs = []  # List of (sender, msg_index) tuples
             bodies = []
@@ -446,11 +451,10 @@ def run_negotiation_phase(env, agents, turn_index, rl_recommendations, negotiati
                         logger.error(f"Probe classification failed (opponents-mode): {e}")
                         results = []
 
-                # Prepend probe labels to message bodies
+                # Prepend probe labels to message bodies (only for deceptive messages)
                 for (sender, msg_idx), res in zip(message_refs, results):
-                    if msg_idx < len(new_missives_by_power[sender]):
-                        original_body = new_missives_by_power[sender][msg_idx].get("body", "")
-                        label_word = "deceptive" if res.get('y', 0) == 1 else "truthful"
+                    if msg_idx < len(new_missives_by_power[sender]) and res.get('y', 0) == 1:
+                        label_word = "deceptive"
                         if "prob_deceptive" in res:
                             prob = res["prob_deceptive"]
                             long_label = f"assessment: {label_word}, deception score {prob:.2f}/1.00 (a low deception score means message is likely to be truthful)"
@@ -460,18 +464,21 @@ def run_negotiation_phase(env, agents, turn_index, rl_recommendations, negotiati
                         new_missives_by_power[sender][msg_idx]["probe_assessment"] = long_label
 
                 # Aggregate short labels per opponent for annotation string (for Probe Power to see next round)
+                # Only include deceptive messages
                 per_sender_labels = {}
                 for sender, res in zip(senders_for_body, results):
+                    if res.get('y', 0) != 1:  # Skip truthful messages
+                        continue
                     lbl = None
                     if isinstance(res, dict) and "prob_deceptive" in res:
                         prob = res["prob_deceptive"]
-                        lbl = f"{'Deceptive' if res.get('y', 0) == 1 else 'Truthful'} {prob:.2f}"
+                        lbl = f"Deceptive {prob:.2f}"
                     elif isinstance(res, dict):
-                        lbl = f"{'Deceptive' if res.get('y', 0) == 1 else 'Truthful'}"
+                        lbl = "Deceptive"
                     else:
                         lbl = "(unavailable)"
                     per_sender_labels.setdefault(sender, []).append(lbl)
-                
+
                 parts = []
                 for sender, labels in per_sender_labels.items():
                     if labels:
@@ -857,7 +864,10 @@ def main():
     # Load probe if enabled
     if args.enable_probe:
         if not args.probe_artifact:
-            logger.warning("--enable-probe set but --probe-artifact not provided; disabling probe.")
+            if args.random_probe_outputs:
+                logger.info("--enable-probe with --random-probe-outputs: using random probe outputs without loading artifact.")
+            else:
+                logger.warning("--enable-probe set but --probe-artifact not provided; disabling probe.")
         else:
             try:
                 probe_ctx = load_probe(args.probe_artifact, device=args.probe_device)
